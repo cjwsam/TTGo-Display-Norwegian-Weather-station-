@@ -13,9 +13,8 @@
  */
 
 /***************************************************
-   FULL CODE (TTGO T-Display + ArduinoJson Filter):
-   WiFi Fallback + Captive Portal + EEPROM +
-   Weather Forecast + OTA + TFT Display.
+   TTGO T-Display Weather Station + Captive Portal
+   with Lat/Lon customization, WiFi fallback, and OTA
 ****************************************************/
 
 #include <FS.h>             // Filesystem support
@@ -36,32 +35,50 @@ using fs::FS;
 
 /********************************************************
  *               EEPROM Storage Settings
- *  These define how we store WiFi credentials in EEPROM.
+ *
+ *  We store:
+ *    SSID (max 32 chars)
+ *    Password (max 32 chars)
+ *    Lat (max 8 chars)
+ *    Lon (max 8 chars)
+ *
+ *  Total needed is well under 128 bytes,
+ *  so we set EEPROM_SIZE to 128 to be safe.
  ********************************************************/
-#define EEPROM_SIZE   96        // Adjust if you need more space
+#define EEPROM_SIZE   128
+
 #define SSID_ADDR     0
 #define SSID_MAX_LEN  32
-#define PASS_ADDR     (SSID_ADDR + SSID_MAX_LEN)
-#define PASS_MAX_LEN  64
+
+#define PASS_ADDR     (SSID_ADDR + SSID_MAX_LEN) // 32
+#define PASS_MAX_LEN  32
+
+#define LAT_ADDR      (PASS_ADDR + PASS_MAX_LEN) // 64
+#define LAT_MAX_LEN   8
+
+#define LON_ADDR      (LAT_ADDR + LAT_MAX_LEN)   // 72
+#define LON_MAX_LEN   8
 
 String storedSsid;
 String storedPass;
+String storedLat; // e.g. "59.91"
+String storedLon; // e.g. "10.75"
 
 /********************************************************
  *                 WiFi & API Settings
- *  Default AP credentials used if no valid WiFi data
- *  is found in EEPROM.
+ *  If no credentials are found, these defaults are used
+ *  to set up a fallback AP. Also see the new lat/lon
+ *  fields stored in EEPROM for your location.
  ********************************************************/
 #define DEFAULT_AP_SSID      "ESP32_AP"
 #define DEFAULT_AP_PASSWORD  "password123"
 
-// MET API URL for Grønland, Oslo (lat=59.91, lon=10.75).  
-// Change lat/lon to your location if desired.
-const char* weatherURL = "https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=59.91&lon=10.75";
+// Default location if lat/lon are not stored or empty
+#define DEFAULT_LAT  "59.91"
+#define DEFAULT_LON  "10.75"
 
 /********************************************************
  *                   Button Pins
- *  For TTGO T-Display, these are typical button inputs.
  ********************************************************/
 const int BUTTON_PIN      = 0;
 const int BUTTON_PIN_NEXT = 35;
@@ -82,11 +99,11 @@ void drawSmallForecastIcon(int cond, int x, int y);
  *                   Global State
  ********************************************************/
 volatile bool displayOn   = true;
-int forecastPage          = 0;   // Tracks which display page (0..4)
+int forecastPage          = 0;   // 0..4
 TFT_eSPI tft              = TFT_eSPI();
 
 // On TTGO T-Display, rotation might produce 135×240 or 240×135.
-// We use a Sprite the same size as tft.width()/height().
+// We'll use a Sprite that matches tft.width()/height().
 TFT_eSprite spr           = TFT_eSprite(&tft);
 
 const int forecastHeight  = 140; // Bottom area used for "today" data
@@ -97,7 +114,7 @@ struct DailyForecast {
   String dateLabel;   // e.g., "14 Feb"
   float highTemp;
   float lowTemp;
-  int   weatherCondition; // 0..5 (we'll map symbols to these)
+  int   weatherCondition; // 0..5
 };
 
 DailyForecast forecastDays[4]; // [0]=today, [1..3]=next 3 days
@@ -109,7 +126,7 @@ int    daySymbolsCount[4] = {0, 0, 0, 0};
 
 float currentTemperature  = 0.0;
 String weatherSymbol      = "";
-int weatherCondition      = 1; // Start with "Cloudy" by default
+int weatherCondition      = 1;  // default to Cloudy
 
 unsigned long lastWeatherUpdate           = 0;
 const unsigned long weatherUpdateInterval = 10UL * 60UL * 1000UL; // 10 minutes
@@ -122,16 +139,33 @@ DNSServer dnsServer;
 bool inFallbackAP = false;
 const byte DNS_PORT = 53;
 
-// We'll allocate a global JSON buffer for weather data
+// We'll allocate a global JSON buffer if needed
 DynamicJsonDocument jsonAppBuffer(4096);
+
+/********************************************************
+ *            Function to Build Weather API URL
+ *  Uses the stored latitude & longitude from EEPROM.
+ *  Falls back to defaults if they are missing/empty.
+ ********************************************************/
+String buildWeatherURL() {
+  if (storedLat.length() == 0) storedLat = DEFAULT_LAT;
+  if (storedLon.length() == 0) storedLon = DEFAULT_LON;
+  // MET API for locationforecast/2.0
+  // Example: "https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=59.91&lon=10.75"
+  String url = "https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=" + storedLat + "&lon=" + storedLon;
+  return url;
+}
 
 /********************************************************
  *                EEPROM Functions
  ********************************************************/
 void loadCredentials() {
   EEPROM.begin(EEPROM_SIZE);
+
   char ssid[SSID_MAX_LEN + 1];
   char pass[PASS_MAX_LEN + 1];
+  char latBuff[LAT_MAX_LEN + 1];
+  char lonBuff[LON_MAX_LEN + 1];
 
   for (int i = 0; i < SSID_MAX_LEN; i++) {
     ssid[i] = char(EEPROM.read(SSID_ADDR + i));
@@ -143,14 +177,31 @@ void loadCredentials() {
   }
   pass[PASS_MAX_LEN] = '\0';
 
+  for (int i = 0; i < LAT_MAX_LEN; i++) {
+    latBuff[i] = char(EEPROM.read(LAT_ADDR + i));
+  }
+  latBuff[LAT_MAX_LEN] = '\0';
+
+  for (int i = 0; i < LON_MAX_LEN; i++) {
+    lonBuff[i] = char(EEPROM.read(LON_ADDR + i));
+  }
+  lonBuff[LON_MAX_LEN] = '\0';
+
   storedSsid = String(ssid);
   storedPass = String(pass);
+  storedLat  = String(latBuff);
+  storedLon  = String(lonBuff);
 
   EEPROM.end();
-  Serial.printf("Loaded credentials: SSID='%s'\n", storedSsid.c_str());
+  Serial.printf("Loaded credentials from EEPROM:\n");
+  Serial.printf("  SSID='%s'\n", storedSsid.c_str());
+  Serial.printf("  PASS='%s' (hidden)\n", storedPass.c_str());
+  Serial.printf("  LAT='%s'\n", storedLat.c_str());
+  Serial.printf("  LON='%s'\n", storedLon.c_str());
 }
 
-void saveCredentials(String ssid, String pass) {
+void saveCredentials(const String &ssid, const String &pass,
+                     const String &lat,  const String &lon) {
   EEPROM.begin(EEPROM_SIZE);
 
   // First clear the EEPROM region
@@ -168,16 +219,26 @@ void saveCredentials(String ssid, String pass) {
     EEPROM.write(PASS_ADDR + i, pass[i]);
   }
 
+  // Store Lat
+  for (int i = 0; i < lat.length() && i < LAT_MAX_LEN; i++) {
+    EEPROM.write(LAT_ADDR + i, lat[i]);
+  }
+
+  // Store Lon
+  for (int i = 0; i < lon.length() && i < LON_MAX_LEN; i++) {
+    EEPROM.write(LON_ADDR + i, lon[i]);
+  }
+
   EEPROM.commit();
   EEPROM.end();
-  Serial.println("Credentials saved to EEPROM.");
+  Serial.println("Credentials (incl. lat/lon) saved to EEPROM.");
 }
 
 /********************************************************
  *                Utility Functions
  ********************************************************/
 bool isNightMode() {
-  // Checks current time to decide if it's "night" (<6 or >=18)
+  // Checks the current time to decide if it's "night" (<6 or >=18)
   time_t now = time(nullptr);
   struct tm *tm_info = localtime(&now);
   int hour = tm_info->tm_hour;
@@ -203,7 +264,7 @@ bool checkForButtonToggle() {
       if (!displayOn) displaySleep(true);
       else            displaySleep(false);
 
-      // Wait until button is released
+      // Wait until the button is released
       while (digitalRead(BUTTON_PIN) == LOW) { delay(10); }
       Serial.printf("Display toggled: now %s\n", displayOn ? "ON" : "OFF");
       return true;
@@ -212,7 +273,7 @@ bool checkForButtonToggle() {
   return false;
 }
 
-// Checks if the second button has been pressed to switch forecast pages
+// Checks if the second button was pressed to switch forecast pages
 bool checkForNextButton() {
   if (digitalRead(BUTTON_PIN_NEXT) == LOW) {
     delay(50);
@@ -226,7 +287,7 @@ bool checkForNextButton() {
   return false;
 }
 
-// If the display is off, this waits until it is turned back on
+// If the display is off, wait until it's turned on
 void waitForDisplayOn() {
   while (!displayOn) {
     if (digitalRead(BUTTON_PIN) == LOW) {
@@ -245,7 +306,7 @@ void waitForDisplayOn() {
  *             Helper Drawing Functions
  ********************************************************/
 void drawArc(TFT_eSprite &sprite, int x, int y, int radius, int dummy, int start_angle, int end_angle, uint16_t color, int thickness) {
-  // This function draws an arc by segmenting it into lines
+  // Draws an arc by segmenting it into lines
   const int segments = 30;
   float startRad = start_angle * DEG_TO_RAD;
   float endRad = end_angle * DEG_TO_RAD;
@@ -263,7 +324,7 @@ void drawArc(TFT_eSprite &sprite, int x, int y, int radius, int dummy, int start
 }
 
 /********************************************************
- *      parseIsoTimeToEpoch() => local time_t
+ *   parseIsoTimeToEpoch() => local time_t
  *  Converts an ISO8601 string into a time_t (epoch).
  ********************************************************/
 time_t parseIsoTimeToEpoch(const char* isoTime) {
@@ -334,7 +395,8 @@ void updateWeather() {
   }
 
   HTTPClient http;
-  http.begin(weatherURL);
+  String url = buildWeatherURL();
+  http.begin(url);
   http.addHeader("User-Agent", "ESP32-Weather (example@example.com)");
   int httpCode = http.GET();
 
@@ -364,7 +426,7 @@ void updateWeather() {
     while (stream->available()) {
       char c = (char)stream->read();
       payload += c;
-      timeout = millis(); // reset timeout since data is arriving
+      timeout = millis(); // reset timeout if data is arriving
     }
     if (millis() - timeout > 5000) {
       Serial.println("Timeout reading HTTP response.");
@@ -500,8 +562,6 @@ void updateWeather() {
 
 /********************************************************
  *   getConditionText() & getConditionColor()
- *   Maps numeric weatherCondition to descriptive text
- *   and color codes for the display.
  ********************************************************/
 String getConditionText(int wc) {
   switch (wc) {
@@ -593,7 +653,7 @@ void drawForecastIcon(int cond, bool night, int x, int y, int size) {
 }
 
 /********************************************************
- *   drawSmallForecastIcon() => simplified icons
+ *   drawSmallForecastIcon() => simpler icons
  ********************************************************/
 void drawSmallForecastIcon(int cond, int x, int y) {
   int size = 10;
@@ -632,14 +692,14 @@ void drawSmallForecastIcon(int cond, int x, int y) {
   }
 }
 
-// Draw a small WiFi icon using arcs
+// Draw small WiFi icon using arcs
 void drawSmallWiFiIcon(int x, int y, uint16_t color) {
   drawArc(spr, x, y, 6, 6, 210, 330, color, 2);
   drawArc(spr, x, y, 4, 4, 210, 330, color, 2);
   drawArc(spr, x, y, 2, 2, 210, 330, color, 2);
 }
 
-// Draw a small memory chip icon
+// Draw small memory chip icon
 void drawSmallMemoryIcon(int x, int y, uint16_t color) {
   spr.drawRect(x - 6, y - 4, 12, 8, color);
   spr.drawPixel(x - 3, y - 5, color);
@@ -652,7 +712,7 @@ void drawSmallMemoryIcon(int x, int y, uint16_t color) {
   spr.drawPixel(x + 3, y + 4, color);
 }
 
-// Draw a small CPU icon
+// Draw small CPU icon
 void drawSmallCPUIcon(int x, int y, uint16_t color) {
   spr.fillCircle(x, y, 5, TFT_BLACK);
   spr.drawCircle(x, y, 5, color);
@@ -671,7 +731,6 @@ void drawSmallIPIcon(int x, int y, uint16_t color) {
 
 /********************************************************
  *   Stats Page Display
- *   Displays WiFi, memory, CPU, and IP info.
  ********************************************************/
 void displayStatsPage() {
   spr.fillSprite(TFT_BLACK);
@@ -724,7 +783,7 @@ void displayStatsPage() {
     lineY += 20;
     spr.setTextDatum(ML_DATUM);
     spr.setTextColor(TFT_YELLOW, TFT_BLACK);
-    spr.drawString("Fallback AP active", 20, lineY);
+    spr.drawString("AP Mode waiting...", 20, lineY);
   }
 }
 
@@ -796,9 +855,10 @@ void displayDailySummaryPage(int index) {
   String title = df.dayOfWeek + " " + df.dateLabel;
   spr.drawString(title, spr.width() / 2, 25);
 
+  // Reduced icon size from 24 => 16 so it's not too large
   int iconX = spr.width() / 2;
   int iconY = 65;
-  int iconSize = 24;
+  int iconSize = 16; 
   drawForecastIcon(df.weatherCondition, false, iconX, iconY, iconSize);
 
   spr.setFreeFont(&FreeSans9pt7b);
@@ -817,6 +877,7 @@ void displayDailySummaryPage(int index) {
 
 /********************************************************
  *   Captive Portal – HTML Form
+ *   Now includes fields for lat/lon.
  ********************************************************/
 const char* portalForm = R"rawliteral(
 <!DOCTYPE html>
@@ -840,12 +901,16 @@ const char* portalForm = R"rawliteral(
 </head>
 <body>
   <div class="container">
-    <h2>Configure WiFi</h2>
+    <h2>Configure WiFi & Location</h2>
     <form method="POST" action="/save">
       <label for="ssid">SSID:</label>
       <input type="text" id="ssid" name="ssid" required>
       <label for="pass">Password:</label>
       <input type="password" id="pass" name="pass" required>
+      <label for="lat">Latitude:</label>
+      <input type="text" id="lat" name="lat" placeholder="e.g. 59.91" required>
+      <label for="lon">Longitude:</label>
+      <input type="text" id="lon" name="lon" placeholder="e.g. 10.75" required>
       <input type="submit" value="Save & Connect">
     </form>
   </div>
@@ -858,15 +923,21 @@ void handleRoot() {
 }
 
 void handleSave() {
-  if (webServer.hasArg("ssid") && webServer.hasArg("pass")) {
+  if (webServer.hasArg("ssid") && webServer.hasArg("pass") &&
+      webServer.hasArg("lat")  && webServer.hasArg("lon")) {
+
     String newSsid = webServer.arg("ssid");
     String newPass = webServer.arg("pass");
-    saveCredentials(newSsid, newPass);
+    String newLat  = webServer.arg("lat");
+    String newLon  = webServer.arg("lon");
+
+    saveCredentials(newSsid, newPass, newLat, newLon);
+
     webServer.send(200, "text/html", "<html><body><h2>Saved. Rebooting...</h2></body></html>");
     delay(1000);
     ESP.restart();
   } else {
-    webServer.send(200, "text/html", "<html><body><h2>Missing SSID or Pass</h2></body></html>");
+    webServer.send(200, "text/html", "<html><body><h2>Missing field (SSID, Pass, Lat, Lon)</h2></body></html>");
   }
 }
 
@@ -881,18 +952,6 @@ void handleCaptivePortal() {
  ********************************************************/
 void startCaptivePortalAP() {
   inFallbackAP = true;
-  tft.setRotation(1);
-
-  spr.deleteSprite();
-  spr.createSprite(tft.width(), tft.height());
-
-  spr.fillSprite(TFT_BLACK);
-  spr.setTextDatum(MC_DATUM);
-  spr.setFreeFont(&FreeSansBold12pt7b);
-  spr.setTextColor(TFT_RED, TFT_BLACK);
-  spr.drawString("WiFi FAIL => AP Mode", spr.width() / 2, spr.height() / 2);
-  spr.pushSprite(0, 0);
-
   WiFi.mode(WIFI_AP);
   WiFi.softAP(DEFAULT_AP_SSID, DEFAULT_AP_PASSWORD);
 
@@ -909,9 +968,34 @@ void startCaptivePortalAP() {
   webServer.on("/save", HTTP_POST, handleSave);
   webServer.begin();
 
-  Serial.println("AP started. Connect to:");
+  Serial.println("===== AP started! =====");
+  Serial.print("SSID: ");
   Serial.println(DEFAULT_AP_SSID);
-  Serial.println("Then open browser => http://192.168.4.1");
+  Serial.print("Password: ");
+  Serial.println(DEFAULT_AP_PASSWORD);
+  Serial.println("Open browser => http://192.168.4.1");
+
+  // Draw a quick message on screen so user knows AP is up
+  tft.setRotation(1);
+  spr.deleteSprite();
+  spr.createSprite(tft.width(), tft.height());
+
+  spr.fillSprite(TFT_BLACK);
+  spr.setTextDatum(MC_DATUM);
+  spr.setFreeFont(&FreeSansBold12pt7b);
+  spr.setTextColor(TFT_YELLOW, TFT_BLACK);
+  spr.drawString("AP MODE:", spr.width() / 2, spr.height() / 2 - 20);
+
+  spr.setFreeFont(&FreeSans9pt7b);
+  spr.setTextColor(TFT_WHITE, TFT_BLACK);
+  String msg = String("SSID: ") + DEFAULT_AP_SSID;
+  spr.drawString(msg, spr.width() / 2, spr.height() / 2 + 10);
+  msg = String("Pass: ") + DEFAULT_AP_PASSWORD;
+  spr.drawString(msg, spr.width() / 2, spr.height() / 2 + 30);
+  msg = "URL: 192.168.4.1";
+  spr.drawString(msg, spr.width() / 2, spr.height() / 2 + 50);
+
+  spr.pushSprite(0, 0);
 }
 
 /********************************************************
@@ -924,6 +1008,7 @@ void connectWiFi() {
     startCaptivePortalAP();
     return;
   }
+
   Serial.printf("Connecting to WiFi SSID: %s\n", storedSsid.c_str());
   WiFi.mode(WIFI_STA);
   WiFi.begin(storedSsid.c_str(), storedPass.c_str());
@@ -956,7 +1041,7 @@ void connectWiFi() {
     spr.deleteSprite();
     spr.createSprite(tft.width(), tft.height());
   } else {
-    Serial.println("\nFailed to connect to WiFi, starting AP mode...");
+    Serial.println("\nFailed to connect to WiFi => AP mode...");
     startCaptivePortalAP();
   }
 }
@@ -994,13 +1079,10 @@ void setupOTA() {
 
 /********************************************************
  *                   setup()
- *  Initializes the TFT, tries to connect to WiFi or
- *  set up captive portal, configures time, starts OTA,
- *  and runs a brief icon test.
  ********************************************************/
 void setup() {
   Serial.begin(115200);
-  Serial.println("Booting Forecast + Stats + TFT Display (EEPROM + Captive Portal + OTA)...");
+  Serial.println("Booting Forecast + Stats + TFT Display with Lat/Lon config...");
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(BUTTON_PIN_NEXT, INPUT_PULLUP);
@@ -1027,7 +1109,7 @@ void setup() {
   }
 
   // Brief test animation for each weather condition
-  const int testDuration = 1800; // ms for each condition
+  const int testDuration = 1000; // ms for each condition
   for (int cond = 0; cond < 6; cond++) {
     unsigned long start = millis();
     while (millis() - start < testDuration) {
@@ -1064,7 +1146,7 @@ void setup() {
     for (int y = 0; y < spr.height(); y += 4) {
       spr.fillRect(0, y, spr.width(), 4, TFT_BLACK);
       spr.pushSprite(0, 0);
-      delay(10);
+      delay(5);
     }
   }
 }
@@ -1078,7 +1160,10 @@ void loop() {
     dnsServer.processNextRequest();
     webServer.handleClient();
     checkForButtonToggle();
-    delay(30);
+
+    // Optionally refresh the "AP mode" screen?
+    // We'll keep it simple: no repeated screen draw here
+    delay(50);
     return;
   }
 
